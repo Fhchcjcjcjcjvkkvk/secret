@@ -1,77 +1,75 @@
 import os
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import AES
-from Crypto.Protocol.KDF import scrypt
-from Crypto.Random import get_random_bytes
-from Crypto.Util.Padding import pad, unpad
-from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import hashlib
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import base64
+from cryptography.hazmat.primitives import hashes
 
-# Function to generate Diffie-Hellman parameters for key exchange
-def generate_dh_parameters():
-    parameters = dh.generate_parameters(generator=2, key_size=2048)
-    return parameters
+# Step 1: Key Exchange using ECDH (X25519)
+def generate_private_key():
+    return x25519.X25519PrivateKey.generate()
 
-# Function to generate a key pair for DH
-def generate_dh_keypair(parameters):
-    private_key = parameters.generate_private_key()
-    public_key = private_key.public_key()
-    return private_key, public_key
-
-# Function to perform DH key exchange and derive a shared key
-def derive_shared_key(private_key, peer_public_key):
-    shared_key = private_key.exchange(dh.ECDH(), peer_public_key)
+def generate_shared_key(private_key, peer_public_key):
+    peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_key)
+    shared_key = private_key.exchange(peer_public_key)
     return shared_key
 
-# Function to generate AES key from the shared key
-def generate_aes_key(shared_key):
-    # Use PBKDF2 or scrypt to derive an AES key
-    return scrypt(shared_key, salt=b'salt', key_len=32, N=2**14, r=8, p=1)
+# Step 2: Key Derivation using HKDF
+def derive_keys(shared_key):
+    # Derive multiple keys from shared secret using HKDF
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,  # This will give us two 32-byte keys
+        salt=None,
+        info=b"fantomcrypt",
+    )
+    return hkdf.derive(shared_key)
 
-# Function to encrypt the message using AES (CBC mode)
-def encrypt_message(aes_key, message):
-    cipher = AES.new(aes_key, AES.MODE_CBC)
-    ciphertext = cipher.encrypt(pad(message.encode(), AES.block_size))
-    return cipher.iv + ciphertext
+# Step 3: AES Encryption (GCM Mode)
+def aes_encrypt(key, plaintext):
+    nonce = os.urandom(12)
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(plaintext.encode()) + encryptor.finalize()
+    return base64.b64encode(nonce + encryptor.tag + ciphertext).decode()
 
-# Function to decrypt the message using AES (CBC mode)
-def decrypt_message(aes_key, ciphertext):
-    iv = ciphertext[:16]
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
-    decrypted_message = unpad(cipher.decrypt(ciphertext[16:]), AES.block_size)
-    return decrypted_message.decode()
+def aes_decrypt(key, encrypted_text):
+    encrypted_data = base64.b64decode(encrypted_text.encode())
+    nonce, tag, ciphertext = encrypted_data[:12], encrypted_data[12:28], encrypted_data[28:]
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
+    decryptor = cipher.decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
 
-# Main function to simulate the FantomCRYPT protocol
-def fantomcrypt_protocol():
-    # Step 1: Generate DH parameters and key pairs for both parties
-    parameters = generate_dh_parameters()
-    
-    # Alice's key pair
-    alice_private_key, alice_public_key = generate_dh_keypair(parameters)
-    
-    # Bob's key pair
-    bob_private_key, bob_public_key = generate_dh_keypair(parameters)
-    
-    # Step 2: Perform the Diffie-Hellman exchange to derive the shared keys
-    alice_shared_key = derive_shared_key(alice_private_key, bob_public_key)
-    bob_shared_key = derive_shared_key(bob_private_key, alice_public_key)
-    
-    # Step 3: Derive AES keys from the shared keys (both should be the same)
-    alice_aes_key = generate_aes_key(alice_shared_key)
-    bob_aes_key = generate_aes_key(bob_shared_key)
-    
-    # Step 4: Alice sends an encrypted message to Bob
-    message_to_encrypt = input("Enter message to encrypt: ")
-    encrypted_message = encrypt_message(alice_aes_key, message_to_encrypt)
-    
-    print(f"Encrypted message: {encrypted_message.hex()}")
-    
-    # Step 5: Bob decrypts the message
-    decrypted_message = decrypt_message(bob_aes_key, encrypted_message)
-    
+# Step 4: Double Ratchet (Key Update and Ratchet)
+def update_ratchet_key(shared_key, ratchet_key):
+    # Update key using a simple hash function (e.g., SHA256 or something more complex)
+    return hashlib.sha256(shared_key + ratchet_key).digest()
+
+# Example usage of the above steps
+def phantomcrypt():
+    # Key exchange: Alice and Bob generate private keys and exchange public keys securely
+    alice_private_key = generate_private_key()
+    bob_private_key = generate_private_key()
+
+    # Bob and Alice exchange public keys (over a secure channel)
+    alice_shared_key = generate_shared_key(alice_private_key, bob_private_key.public_key().public_bytes())
+    bob_shared_key = generate_shared_key(bob_private_key, alice_private_key.public_key().public_bytes())
+
+    # Derive session keys
+    alice_session_keys = derive_keys(alice_shared_key)
+    bob_session_keys = derive_keys(bob_shared_key)
+
+    # Update ratchet keys
+    alice_ratchet_key = update_ratchet_key(alice_shared_key, alice_session_keys[0])
+    bob_ratchet_key = update_ratchet_key(bob_shared_key, bob_session_keys[0])
+
+    # Encrypt and Decrypt messages using AES
+    message = input("Enter message to encrypt: ")
+    encrypted_message = aes_encrypt(alice_session_keys[0], message)
+    print(f"Encrypted message: {encrypted_message}")
+    decrypted_message = aes_decrypt(bob_session_keys[0], encrypted_message)
     print(f"Decrypted message: {decrypted_message}")
 
-# Run the FantomCRYPT protocol
-fantomcrypt_protocol()
+if __name__ == "__main__":
+    phantomcrypt()
